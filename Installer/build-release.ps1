@@ -21,6 +21,7 @@ New-Item -ItemType Directory -Path (Join-Path $packageRoot "firmware\s3") | Out-
 
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "Install OnOff Sensor.bat") -Destination $packageRoot
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install.ps1") -Destination $packageRoot
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "README.txt") -Destination $packageRoot
 Copy-Item -LiteralPath $EsptoolPath -Destination (Join-Path $packageRoot "esptool.exe")
 
 $licensePath = Join-Path (Split-Path -Parent $EsptoolPath) "LICENSE"

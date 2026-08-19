@@ -1,5 +1,7 @@
 param(
-    [switch]$DetectOnly
+    [switch]$DetectOnly,
+    [switch]$SkipUpdate,
+    [switch]$CheckForUpdatesOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +22,77 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
 }
 
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+
+function Convert-Version([string]$Value) {
+    if ($Value -notmatch '^v?(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z]+)(\d+)?)?$') { return $null }
+    return [pscustomobject]@{
+        Major = [int]$matches[1]
+        Minor = [int]$matches[2]
+        Patch = [int]$matches[3]
+        Label = [string]$matches[4]
+        LabelNumber = if ($matches[5]) { [int]$matches[5] } else { 0 }
+    }
+}
+
+function Compare-Version([string]$Left, [string]$Right) {
+    $a = Convert-Version $Left
+    $b = Convert-Version $Right
+    if ($null -eq $a -or $null -eq $b) { return [string]::Compare($Left, $Right, $true) }
+    foreach ($property in @('Major', 'Minor', 'Patch')) {
+        if ($a.$property -lt $b.$property) { return -1 }
+        if ($a.$property -gt $b.$property) { return 1 }
+    }
+    if (-not $a.Label -and $b.Label) { return 1 }
+    if ($a.Label -and -not $b.Label) { return -1 }
+    $labelComparison = [string]::Compare($a.Label, $b.Label, $true)
+    if ($labelComparison -ne 0) { return $labelComparison }
+    return $a.LabelNumber.CompareTo($b.LabelNumber)
+}
+
+function Start-NewerInstaller($Release, $Asset) {
+    $updateRoot = Join-Path ([IO.Path]::GetTempPath()) ("OnOff-Sensor-Update-" + [guid]::NewGuid().ToString('N'))
+    $zipPath = Join-Path $updateRoot "installer.zip"
+    try {
+        New-Item -ItemType Directory -Path $updateRoot | Out-Null
+        Write-Host "Downloading newer release $($Release.tag_name)..."
+        Invoke-WebRequest -UseBasicParsing -Uri $Asset.browser_download_url -OutFile $zipPath
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $updateRoot
+        $newScript = Get-ChildItem -LiteralPath $updateRoot -Recurse -File -Filter "install.ps1" | Select-Object -First 1
+        if ($null -eq $newScript) { throw "Downloaded release does not contain install.ps1" }
+        $childArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $newScript.FullName, '-SkipUpdate')
+        if ($DetectOnly) { $childArguments += '-DetectOnly' }
+        if ($CheckForUpdatesOnly) { $childArguments += '-CheckForUpdatesOnly' }
+        & powershell.exe @childArguments
+        return $LASTEXITCODE
+    } finally {
+        if (Test-Path -LiteralPath $updateRoot) { Remove-Item -LiteralPath $updateRoot -Recurse -Force }
+    }
+}
+
+if (-not $SkipUpdate) {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $headers = @{ 'User-Agent' = 'OnOff-Sensor-Installer'; 'Accept' = 'application/vnd.github+json' }
+        $releases = @(Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/rutgers-caes-research/OnOff_Sensor/releases?per_page=20')
+        $usePrereleases = ([string]$manifest.version) -match '-'
+        $release = $releases | Where-Object { -not $_.draft -and ($usePrereleases -or -not $_.prerelease) } | Select-Object -First 1
+        if ($null -ne $release -and (Compare-Version ([string]$release.tag_name) ([string]$manifest.version)) -gt 0) {
+            $asset = $release.assets | Where-Object { $_.name -like 'OnOff-Sensor-Installer-*.zip' } | Select-Object -First 1
+            if ($null -ne $asset) {
+                $result = Start-NewerInstaller $release $asset
+                exit $result
+            }
+        }
+        Write-Host "Installer firmware is current: $($manifest.version)"
+    } catch {
+        Write-Host "Update check unavailable; using included firmware."
+    }
+}
+
+if ($CheckForUpdatesOnly) {
+    Write-Host "Update check complete."
+    exit 0
+}
 
 foreach ($boardName in @("c3", "s3")) {
     $board = $manifest.boards.$boardName
