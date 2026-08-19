@@ -1,0 +1,45 @@
+name: Build installer release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install pinned ESP32 core
+        shell: pwsh
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+
+      - name: Compile C3 and S3
+        shell: pwsh
+        run: |
+          arduino-cli compile --jobs 1 --fqbn esp32:esp32:XIAO_ESP32C3 --output-dir build/c3 Firmware/Current/new_xiao_onoff_v6
+          arduino-cli compile --jobs 1 --fqbn esp32:esp32:XIAO_ESP32S3 --output-dir build/s3 Firmware/Current/new_xiao_onoff_v6
+
+      - name: Package installer
+        shell: pwsh
+        run: |
+          $esptool = Get-ChildItem "$env:LOCALAPPDATA/Arduino15/packages/esp32/tools/esptool_py" -Recurse -File -Filter esptool.exe | Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $esptool) { throw "esptool.exe was not installed with the ESP32 core" }
+          $bootApp = "$env:LOCALAPPDATA/Arduino15/packages/esp32/hardware/esp32/3.3.10/tools/partitions/boot_app0.bin"
+          ./Installer/build-release.ps1 -Version "${{ github.ref_name }}" -C3Build build/c3 -S3Build build/s3 -BootAppPath $bootApp -EsptoolPath $esptool.FullName
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Get-ChildItem Installer/dist/*.zip | Select-Object -ExpandProperty FullName
+          gh release create "${{ github.ref_name }}" $zip --title "OnOff Sensor ${{ github.ref_name }}" --generate-notes

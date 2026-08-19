@@ -1,6 +1,7 @@
 # Generated firmware builds
 build/
 **/build/
+Installer/dist/
 *.elf
 *.map
 *.o
