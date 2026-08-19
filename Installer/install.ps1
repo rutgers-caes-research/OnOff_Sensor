@@ -115,7 +115,8 @@ if (-not $SkipUpdate) {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $headers = @{ 'User-Agent' = 'OnOff-Sensor-Installer'; 'Accept' = 'application/vnd.github+json' }
-        $releases = @(Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/rutgers-caes-research/OnOff_Sensor/releases?per_page=20')
+        $releaseResponse = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/rutgers-caes-research/OnOff_Sensor/releases?per_page=20'
+        $releases = @($releaseResponse | ForEach-Object { $_ })
         $usePrereleases = ([string]$manifest.version) -match '-'
         $release = $releases | Where-Object { -not $_.draft -and ($usePrereleases -or -not $_.prerelease) } | Select-Object -First 1
     } catch {
