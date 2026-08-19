@@ -1,0 +1,25 @@
+# Generated firmware builds
+build/
+**/build/
+*.elf
+*.map
+*.o
+*.d
+*.a
+
+# Local credentials and profiles
+.env
+*.local
+*.xml
+
+# Python installer tooling
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editors and operating systems
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
