@@ -1,7 +1,8 @@
 param(
     [switch]$DetectOnly,
     [switch]$SkipUpdate,
-    [switch]$CheckForUpdatesOnly
+    [switch]$CheckForUpdatesOnly,
+    [switch]$Confirmed
 )
 
 $ErrorActionPreference = "Stop"
@@ -62,6 +63,7 @@ function Start-NewerInstaller($Release, $Asset) {
         $childArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $newScript.FullName, '-SkipUpdate')
         if ($DetectOnly) { $childArguments += '-DetectOnly' }
         if ($CheckForUpdatesOnly) { $childArguments += '-CheckForUpdatesOnly' }
+        if ($Confirmed) { $childArguments += '-Confirmed' }
         & powershell.exe @childArguments
         return $LASTEXITCODE
     } finally {
@@ -69,23 +71,36 @@ function Start-NewerInstaller($Release, $Asset) {
     }
 }
 
+$availableRelease = $null
+$availableAsset = $null
 if (-not $SkipUpdate) {
+    $release = $null
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $headers = @{ 'User-Agent' = 'OnOff-Sensor-Installer'; 'Accept' = 'application/vnd.github+json' }
         $releases = @(Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/rutgers-caes-research/OnOff_Sensor/releases?per_page=20')
         $usePrereleases = ([string]$manifest.version) -match '-'
         $release = $releases | Where-Object { -not $_.draft -and ($usePrereleases -or -not $_.prerelease) } | Select-Object -First 1
-        if ($null -ne $release -and (Compare-Version ([string]$release.tag_name) ([string]$manifest.version)) -gt 0) {
-            $asset = $release.assets | Where-Object { $_.name -like 'OnOff-Sensor-Installer-*.zip' } | Select-Object -First 1
-            if ($null -ne $asset) {
-                $result = Start-NewerInstaller $release $asset
-                exit $result
-            }
-        }
-        Write-Host "Installer firmware is current: $($manifest.version)"
     } catch {
         Write-Host "Update check unavailable; using included firmware."
+        $release = $null
+    }
+
+    if ($null -ne $release -and (Compare-Version ([string]$release.tag_name) ([string]$manifest.version)) -gt 0) {
+        $asset = $release.assets | Where-Object { $_.name -like 'OnOff-Sensor-Installer-*.zip' } | Select-Object -First 1
+        if ($null -eq $asset) {
+            Stop-Installer "Release $($release.tag_name) does not contain a complete installer ZIP."
+        }
+
+        if ($CheckForUpdatesOnly) {
+            Write-Host "A newer OnOff Sensor release is available: $($release.tag_name)"
+            Write-Host "Update check complete."
+            exit 0
+        }
+        $availableRelease = $release
+        $availableAsset = $asset
+    } else {
+        Write-Host "Installer firmware is current: $($manifest.version)"
     }
 }
 
@@ -162,10 +177,30 @@ if ($DetectOnly) {
     exit 0
 }
 
-$answer = Read-Host "Install OnOff Sensor $($manifest.version)? Type YES to continue"
-if ($answer -cne "YES") {
-    Write-Host "Cancelled."
-    exit 2
+if (-not $Confirmed) {
+    if ($null -ne $availableRelease) {
+        Write-Host " UPDATE AVAILABLE: $($availableRelease.tag_name) " -ForegroundColor Black -BackgroundColor Yellow
+        $answer = Read-Host "Are you sure you want to install included $($manifest.version)? Type YES, or UPDATE for the latest release"
+        if ($answer -ieq "UPDATE") {
+            try {
+                $Confirmed = $true
+                $result = Start-NewerInstaller $availableRelease $availableAsset
+                exit $result
+            } catch {
+                Stop-Installer "The update could not be downloaded or started. No firmware was installed. $($_.Exception.Message)"
+            }
+        }
+        if ($answer -cne "YES") {
+            Write-Host "Cancelled. No firmware was installed."
+            exit 2
+        }
+    } else {
+        $answer = Read-Host "Install OnOff Sensor $($manifest.version)? Type YES to continue"
+        if ($answer -cne "YES") {
+            Write-Host "Cancelled."
+            exit 2
+        }
+    }
 }
 
 $profile = $manifest.boards.($target.Profile)
