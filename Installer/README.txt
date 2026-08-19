@@ -9,7 +9,9 @@ ONOFF SENSOR INSTALLER
 The installer checks GitHub for a newer release. If one is available, the normal
 installation confirmation warns that the ZIP is outdated. Type YES to use the
 included firmware or UPDATE for the latest release. It never installs an update
-without confirmation. If no internet connection is available, it uses the firmware
-included in this ZIP.
+without confirmation. The installer always uses the folder name
+"OnOff-Sensor-Installer" and displays the exact firmware version on screen. Future
+updates refresh that same folder and ZIP. If no internet connection is available,
+it uses the firmware included in this ZIP.
 
 The normal installation preserves saved CSV data and sensor configuration.

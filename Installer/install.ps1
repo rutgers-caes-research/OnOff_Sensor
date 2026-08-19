@@ -50,24 +50,61 @@ function Compare-Version([string]$Left, [string]$Right) {
     return $a.LabelNumber.CompareTo($b.LabelNumber)
 }
 
+function Copy-PackageContents([string]$Source, [string]$Destination) {
+    if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
+        New-Item -ItemType Directory -Path $Destination | Out-Null
+    }
+    Get-ChildItem -LiteralPath $Source -Force | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $Destination -Recurse -Force
+    }
+}
+
 function Start-NewerInstaller($Release, $Asset) {
-    $updateRoot = Join-Path ([IO.Path]::GetTempPath()) ("OnOff-Sensor-Update-" + [guid]::NewGuid().ToString('N'))
-    $zipPath = Join-Path $updateRoot "installer.zip"
+    $installerParent = Split-Path -Parent $packageRoot
+    $stablePackageRoot = Join-Path $installerParent "OnOff-Sensor-Installer"
+    $savedZipPath = Join-Path $installerParent "OnOff-Sensor-Installer.zip"
+    $stagingRoot = Join-Path $installerParent (".OnOff-Sensor-Update-" + [guid]::NewGuid().ToString('N'))
     try {
-        New-Item -ItemType Directory -Path $updateRoot | Out-Null
+        New-Item -ItemType Directory -Path $stagingRoot | Out-Null
+        $stagedZipPath = Join-Path $stagingRoot "OnOff-Sensor-Installer.zip"
         Write-Host "Downloading newer release $($Release.tag_name)..."
-        Invoke-WebRequest -UseBasicParsing -Uri $Asset.browser_download_url -OutFile $zipPath
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $updateRoot
-        $newScript = Get-ChildItem -LiteralPath $updateRoot -Recurse -File -Filter "install.ps1" | Select-Object -First 1
-        if ($null -eq $newScript) { throw "Downloaded release does not contain install.ps1" }
-        $childArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $newScript.FullName, '-SkipUpdate')
+        Invoke-WebRequest -UseBasicParsing -Uri $Asset.browser_download_url -OutFile $stagedZipPath
+        Expand-Archive -LiteralPath $stagedZipPath -DestinationPath $stagingRoot
+        $stagedScript = Get-ChildItem -LiteralPath $stagingRoot -Recurse -File -Filter "install.ps1" | Select-Object -First 1
+        if ($null -eq $stagedScript) { throw "Downloaded release does not contain install.ps1" }
+        $stagedPackageRoot = Split-Path -Parent $stagedScript.FullName
+        $stagedManifestPath = Join-Path $stagedPackageRoot "manifest.json"
+        if (-not (Test-Path -LiteralPath $stagedManifestPath -PathType Leaf)) {
+            throw "Downloaded release does not contain manifest.json"
+        }
+        $stagedManifest = Get-Content -LiteralPath $stagedManifestPath -Raw | ConvertFrom-Json
+        if ([string]$stagedManifest.version -ne [string]$Release.tag_name) {
+            throw "Downloaded installer version does not match release $($Release.tag_name)"
+        }
+        $childArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $stagedScript.FullName, '-SkipUpdate')
         if ($DetectOnly) { $childArguments += '-DetectOnly' }
         if ($CheckForUpdatesOnly) { $childArguments += '-CheckForUpdatesOnly' }
         if ($Confirmed) { $childArguments += '-Confirmed' }
         & powershell.exe @childArguments
-        return $LASTEXITCODE
+        $result = $LASTEXITCODE
+        if ($result -ne 0) { return $result }
+
+        Copy-PackageContents $stagedPackageRoot $stablePackageRoot
+        Copy-Item -LiteralPath $stagedZipPath -Destination $savedZipPath -Force
+        $savedManifest = Get-Content -LiteralPath (Join-Path $stablePackageRoot "manifest.json") -Raw | ConvertFrom-Json
+        if ([string]$savedManifest.version -ne [string]$Release.tag_name) {
+            throw "Saved installer does not match release $($Release.tag_name)"
+        }
+        Write-Host "Installer updated in: $stablePackageRoot" -ForegroundColor Green
+        return 0
     } finally {
-        if (Test-Path -LiteralPath $updateRoot) { Remove-Item -LiteralPath $updateRoot -Recurse -Force }
+        $resolvedStaging = [IO.Path]::GetFullPath($stagingRoot)
+        $resolvedParent = [IO.Path]::GetFullPath($installerParent).TrimEnd('\') + '\'
+        if ($resolvedStaging.StartsWith($resolvedParent, [StringComparison]::OrdinalIgnoreCase) -and
+            (Split-Path -Leaf $resolvedStaging) -like '.OnOff-Sensor-Update-*' -and
+            (Test-Path -LiteralPath $resolvedStaging)) {
+            Remove-Item -LiteralPath $resolvedStaging -Recurse -Force
+        }
     }
 }
 
@@ -87,7 +124,9 @@ if (-not $SkipUpdate) {
     }
 
     if ($null -ne $release -and (Compare-Version ([string]$release.tag_name) ([string]$manifest.version)) -gt 0) {
-        $asset = $release.assets | Where-Object { $_.name -like 'OnOff-Sensor-Installer-*.zip' } | Select-Object -First 1
+        $asset = $release.assets | Where-Object {
+            $_.name -eq 'OnOff-Sensor-Installer.zip' -or $_.name -like 'OnOff-Sensor-Installer-*.zip'
+        } | Select-Object -First 1
         if ($null -eq $asset) {
             Stop-Installer "Release $($release.tag_name) does not contain a complete installer ZIP."
         }

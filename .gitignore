@@ -2,6 +2,7 @@
 build/
 **/build/
 Installer/dist/
+Installer/Local Test/
 *.elf
 *.map
 *.o

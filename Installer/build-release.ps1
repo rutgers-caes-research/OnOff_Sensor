@@ -8,7 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$packageName = "OnOff-Sensor-Installer-$Version"
+$packageName = "OnOff-Sensor-Installer"
 $packageRoot = Join-Path $OutputDirectory $packageName
 $zipPath = Join-Path $OutputDirectory "$packageName.zip"
 
