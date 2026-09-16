@@ -19,7 +19,7 @@ struct PortalDataState;
 // AP Mode Configuration
 #define AP_SSID "OnOff"
 #define AP_PASS "onoff123"
-constexpr const char* FIRMWARE_VERSION = "6.1.2";
+constexpr const char* FIRMWARE_VERSION = "6.1.3";
 
 // EzAmp-compatible MQTT defaults. V6 changes the device path from ezamp to
 // onoff while allowing a custom server and topic prefix in the field portal.
@@ -92,6 +92,7 @@ float RSSsafety;
 bool isRunning = false;
 bool exitPortal = false;
 bool flashMounted = false;
+volatile bool portalButtonLatched = false;
 
 int deploymentMode = USB_BANK_NO_WIFI;
 String wifiSSID;
@@ -218,20 +219,23 @@ void blinkLED(int times, int durationMs) {
   }
 }
 
+// Record BOOT immediately, including while an MPU measurement is in progress.
+// The main loop consumes this request at the next safe wait point.
+void IRAM_ATTR latchPortalButtonPress() {
+  portalButtonLatched = true;
+}
+
 // --- Smart Delay (Allows button to interrupt USB-bank waits) ---
 void smartDelay(unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) {
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      Serial.println("\n[INTERRUPT] Button pressed! Halting sensor and rebooting...");
+    if (portalButtonLatched || digitalRead(BUTTON_PIN) == LOW) {
+      portalButtonLatched = false;
+      Serial.println("\n[PORTAL] Button pressed! Opening portal without stopping collection...");
       if (mqttEnabled()) persistMqttCursor(true);
-      preferences.putBool("running", false);
-      for (int i = 0; i < 10; i++) {
-        setStatusLed(true);
-        delay(50);
-        setStatusLed(false);
-        delay(50);
-      }
+      // USB-bank modes stay awake, so BOOT is detected here rather than as a
+      // sleep wake event. Preserve the deployment and request a one-time portal.
+      preferences.putBool("portal_requested", true);
       ESP.restart();
     }
     delay(10);
@@ -441,6 +445,12 @@ String messagePage(const String& title, const String& message, int statusCode = 
   return html;
 }
 
+void sendNoCacheHeaders() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+}
+
 // --- Web Server Functions (AP Mode) ---
 void handleRoot() {
   PortalDataState dataState = portalDataState();
@@ -512,11 +522,18 @@ void handleRoot() {
   html += orphanWarning;
 
   if (isRunning) {
-    html += "<h3 style=\"color:#28a745;\">Status: RUNNING</h3>";
-    html += "<p style=\"font-size:12px; color:#666;\">(Will resume sampling when portal closes)</p>";
+    html += "<h3 style=\"color:#28a745;\">Status: COLLECTION ACTIVE</h3>";
+    html += "<p style=\"font-size:12px; color:#666;\">Sampling is paused only while this portal is open. Continue closes the portal and resumes collection.</p>";
+    if (!timeSynced) {
+      html += "<p id=\"sync-status\" style=\"color:#ff9800; font-weight:bold;\">Syncing time from phone before collection resumes...</p>";
+    }
   } else {
     html += "<h3 style=\"color:#dc3545;\">Status: IDLE</h3>";
-    html += "<p id=\"sync-status\" style=\"color:#ff9800; font-weight:bold;\">Syncing backup time from phone...</p>";
+    if (timeSynced) {
+      html += "<p id=\"sync-status\" style=\"color:#28a745; font-weight:bold;\">Time Synced to Phone</p>";
+    } else {
+      html += "<p id=\"sync-status\" style=\"color:#ff9800; font-weight:bold;\">Syncing backup time from phone...</p>";
+    }
   }
 
   if (!flashMounted) {
@@ -534,9 +551,11 @@ void handleRoot() {
   }
 
   if (!isRunning) {
-    html += "<a href=\"/start\"><button id=\"btn-start\" class=\"btn-start\" disabled style=\"opacity:0.5;\">Start Data Collection</button></a>";
+    String startDisabled = timeSynced ? "" : " disabled style=\"opacity:0.5;\"";
+    html += "<a href=\"/start\"><button id=\"btn-start\" class=\"btn-start\"" + startDisabled + ">Start Data Collection</button></a>";
   } else {
-    html += "<a href=\"/stop\"><button class=\"btn-stop\">Stop / Idle Mode</button></a>";
+    html += "<a href=\"/continue\"><button class=\"btn-start\">Continue Data Collection</button></a>";
+    html += "<a href=\"/stop\" onclick=\"return confirm('Stop data collection and leave the sensor idle?');\"><button class=\"btn-stop\">Stop Data Collection</button></a>";
   }
 
   if (dataState.fileSize > 0) {
@@ -616,7 +635,7 @@ void handleRoot() {
   html += "</form>";
   html += "</div>";
 
-  if (!isRunning) {
+  if (!timeSynced) {
     html += "<script>";
     html += "window.onload = function() {";
     html += "  var ts = Math.floor(Date.now() / 1000);";
@@ -635,6 +654,7 @@ void handleRoot() {
 
   html += "<script>toggleNetworkFields();updateGeneratedTopic();updateCsvEstimate();window.onclick=function(e){var m=document.getElementById('infoModal');if(e.target==m)closeInfo();};</script>";
   html += "</body></html>";
+  sendNoCacheHeaders();
   server.send(200, "text/html", html);
 }
 
@@ -650,6 +670,7 @@ void handleSetTime() {
     timeSynced = true;
     distressMode = false;
     Serial.printf("Time successfully synced from browser fallback: %ld\n", unixTime);
+    sendNoCacheHeaders();
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Missing timestamp");
@@ -659,15 +680,31 @@ void handleSetTime() {
 void handleStart() {
   preferences.putBool("running", true);
   isRunning = true;
-  String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{font-family: Arial; text-align: center; margin-top: 50px;}</style></head><body><h2>Collection Started!</h2><p>Portal closing. The sensor will begin sampling.</p></body></html>";
+  String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{font-family: Arial; text-align: center; margin-top: 50px;}</style></head><body><h2>Collection Started</h2><p>Collection is active. The portal is closing and sampling will begin.</p></body></html>";
+  sendNoCacheHeaders();
   server.send(200, "text/html", html);
   delay(1000);
+  exitPortal = true;
+}
+
+void handleContinue() {
+  if (!timeSynced) {
+    messagePage("Time Sync Required", "Wait for the phone-time sync to complete before continuing collection.", 400);
+    return;
+  }
+  preferences.putBool("running", true);
+  isRunning = true;
+  String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{font-family: Arial; text-align: center; margin-top: 50px;}</style></head><body><h2>Collection Continuing</h2><p>The portal is closing and sampling will resume.</p></body></html>";
+  sendNoCacheHeaders();
+  server.send(200, "text/html", html);
+  delay(750);
   exitPortal = true;
 }
 
 void handleStop() {
   preferences.putBool("running", false);
   isRunning = false;
+  sendNoCacheHeaders();
   server.sendHeader("Location", "/");
   server.send(303);
 }
@@ -1264,6 +1301,7 @@ bool waitForMqttCompletion(unsigned long timeoutMs) {
 
 void runPortal(bool emergencyAlarm) {
   Serial.println("\n--- Entering AP Portal Mode ---");
+  portalButtonLatched = false;
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print("AP IP address: ");
@@ -1272,6 +1310,7 @@ void runPortal(bool emergencyAlarm) {
   server.on("/", handleRoot);
   server.on("/settime", handleSetTime);
   server.on("/start", handleStart);
+  server.on("/continue", handleContinue);
   server.on("/stop", handleStop);
   server.on("/clear", handleClear);
   server.on("/new-deployment", handleNewDeployment);
@@ -1578,6 +1617,7 @@ void setup() {
     setStatusLed(false);
   }
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), latchPortalButtonPress, FALLING);
   delay(100);
 
   if (!LittleFS.begin(true)) {
@@ -1595,6 +1635,8 @@ void setup() {
   maxLoggedIntervalMins = max(preferences.getInt("max_log_int", 5), 1L);
   RSSsafety = preferences.getFloat("rss_thresh", 0.028);
   isRunning = preferences.getBool("running", false);
+  bool portalRequested = preferences.getBool("portal_requested", false);
+  if (portalRequested) preferences.remove("portal_requested");
 
   if (preferences.isKey("deploy_mode")) {
     deploymentMode = preferences.getInt("deploy_mode", USB_BANK_NO_WIFI);
@@ -1651,7 +1693,12 @@ void setup() {
     distressMode = false;
   }
 
-  if (digitalRead(BUTTON_PIN) == LOW || wakeReason == ESP_SLEEP_WAKEUP_EXT0) {
+  if (portalRequested) {
+    Serial.println("Portal requested during an active deployment.");
+    openPortal = true;
+    distressMode = false;
+    while (digitalRead(BUTTON_PIN) == LOW) delay(10);
+  } else if (digitalRead(BUTTON_PIN) == LOW || wakeReason == ESP_SLEEP_WAKEUP_EXT0) {
     Serial.println("Button Wake/Hold Detected! Opening Portal.");
     openPortal = true;
     distressMode = false;
