@@ -23,6 +23,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
 }
 
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+$installerVersion = if ($manifest.PSObject.Properties.Name -contains "installerVersion") { [string]$manifest.installerVersion } else { [string]$manifest.version }
 
 function Convert-Version([string]$Value) {
     if ($Value -notmatch '^v?(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z]+)(\d+)?)?$') { return $null }
@@ -108,8 +109,52 @@ function Start-NewerInstaller($Release, $Asset) {
     }
 }
 
+# Future firmware releases can ship this smaller asset. It updates only the
+# application image at 0x10000, preserving the CSV filesystem and preferences.
+function Start-FirmwareUpdate($Release, $Asset, $Target, $InstallerAsset) {
+    $installerParent = Split-Path -Parent $packageRoot
+    $stagingRoot = Join-Path $installerParent (".OnOff-Sensor-Firmware-" + [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $stagingRoot | Out-Null
+        $zipPath = Join-Path $stagingRoot "OnOff-Sensor-Firmware.zip"
+        Write-Host "Downloading firmware update $($Release.tag_name)..."
+        Invoke-WebRequest -UseBasicParsing -Uri $Asset.browser_download_url -OutFile $zipPath
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $stagingRoot
+        $updateManifestPath = Get-ChildItem -LiteralPath $stagingRoot -Recurse -File -Filter "firmware-update.json" | Select-Object -First 1
+        if ($null -eq $updateManifestPath) { throw "Firmware update does not contain firmware-update.json" }
+        $updateManifest = Get-Content -LiteralPath $updateManifestPath.FullName -Raw | ConvertFrom-Json
+        if ([string]$updateManifest.firmwareVersion -ne [string]$Release.tag_name) { throw "Firmware update version does not match release $($Release.tag_name)" }
+        if ((Compare-Version $installerVersion ([string]$updateManifest.minimumInstallerVersion)) -lt 0) {
+            if ($null -ne $InstallerAsset) { return Start-NewerInstaller $Release $InstallerAsset }
+            throw "This firmware requires installer $($updateManifest.minimumInstallerVersion) or newer. Download the full installer ZIP."
+        }
+        foreach ($boardName in @("c3", "s3")) {
+            $relative = [string]$updateManifest.boards.$boardName.application
+            $expected = [string]$updateManifest.boards.$boardName.sha256
+            $source = Join-Path (Split-Path -Parent $updateManifestPath.FullName) $relative
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Firmware update is missing: $relative" }
+            if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw "Firmware verification failed: $relative" }
+            $destination = Join-Path $packageRoot "firmware\\$boardName\\firmware.bin"
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+            $manifest.boards.$boardName.files."firmware/$boardName/firmware.bin" = $expected
+        }
+        $manifest.version = [string]$updateManifest.firmwareVersion
+        $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+        $profile = $manifest.boards.($Target.Profile)
+        $applicationPath = Join-Path $packageRoot ([string]$profile.application)
+        Write-Host "Installing and verifying firmware update..."
+        & $toolPath --chip ([string]$profile.chip) --port ([string]$Target.Port) --baud 460800 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 80m --flash-size ([string]$profile.flashSize) 0x10000 $applicationPath
+        if ($LASTEXITCODE -ne 0) { throw "Firmware flashing failed. The locally saved update is intact; reconnect the sensor and run the installer again." }
+        Write-Host "Firmware update complete. CSV data and configuration were preserved." -ForegroundColor Green
+        return 0
+    } finally {
+        if (Test-Path -LiteralPath $stagingRoot) { Remove-Item -LiteralPath $stagingRoot -Recurse -Force }
+    }
+}
+
 $availableRelease = $null
-$availableAsset = $null
+$availableFirmwareAsset = $null
+$availableInstallerAsset = $null
 if (-not $SkipUpdate) {
     $release = $null
     try {
@@ -125,11 +170,12 @@ if (-not $SkipUpdate) {
     }
 
     if ($null -ne $release -and (Compare-Version ([string]$release.tag_name) ([string]$manifest.version)) -gt 0) {
-        $asset = $release.assets | Where-Object {
+        $firmwareAsset = $release.assets | Where-Object { $_.name -eq 'OnOff-Sensor-Firmware.zip' } | Select-Object -First 1
+        $installerAsset = $release.assets | Where-Object {
             $_.name -eq 'OnOff-Sensor-Installer.zip' -or $_.name -like 'OnOff-Sensor-Installer-*.zip'
         } | Select-Object -First 1
-        if ($null -eq $asset) {
-            Stop-Installer "Release $($release.tag_name) does not contain a complete installer ZIP."
+        if ($null -eq $firmwareAsset -and $null -eq $installerAsset) {
+            Stop-Installer "Release $($release.tag_name) does not contain an installer or firmware update ZIP."
         }
 
         if ($CheckForUpdatesOnly) {
@@ -138,7 +184,8 @@ if (-not $SkipUpdate) {
             exit 0
         }
         $availableRelease = $release
-        $availableAsset = $asset
+        $availableFirmwareAsset = $firmwareAsset
+        $availableInstallerAsset = $installerAsset
     } else {
         Write-Host "Installer firmware is current: $($manifest.version)"
     }
@@ -224,7 +271,7 @@ if (-not $Confirmed) {
         if ($answer -ieq "UPDATE") {
             try {
                 $Confirmed = $true
-                $result = Start-NewerInstaller $availableRelease $availableAsset
+                $result = if ($null -ne $availableFirmwareAsset) { Start-FirmwareUpdate $availableRelease $availableFirmwareAsset $target $availableInstallerAsset } else { Start-NewerInstaller $availableRelease $availableInstallerAsset }
                 exit $result
             } catch {
                 Stop-Installer "The update could not be downloaded or started. No firmware was installed. $($_.Exception.Message)"

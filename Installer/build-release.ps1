@@ -57,6 +57,7 @@ function Get-RelativeHashes([string]$Profile) {
 
 $manifest = [ordered]@{
     version = $Version
+    installerVersion = $Version
     boards = [ordered]@{
         c3 = [ordered]@{
             chip = "esp32c3"; flashSize = "4MB"
